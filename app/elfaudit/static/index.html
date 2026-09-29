@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ELF 重定位审计 · 载荷发布前审查</title>
+<style>
+  :root {
+    --bg: #0f141b; --panel: #171e28; --line: #2a3543;
+    --txt: #e6edf3; --muted: #8b98a8; --accent: #4da3ff;
+    --ok: #2ea043; --ok-bg: #102a17; --bad: #f85149; --bad-bg: #2d1517;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--txt);
+    font: 14px/1.6 -apple-system, "Segoe UI", "PingFang SC",
+          "Microsoft YaHei", sans-serif;
+  }
+  header { padding: 20px 28px; border-bottom: 1px solid var(--line); }
+  header h1 { margin: 0; font-size: 18px; }
+  header p { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
+  main { max-width: 1080px; margin: 0 auto; padding: 24px 28px 60px; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; padding: 18px 20px; margin-bottom: 20px;
+  }
+  .panel h2 { margin: 0 0 14px; font-size: 15px; }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 12px 0 4px; }
+  input[type=text], input[type=file] {
+    width: 100%; background: #0d1117; color: var(--txt);
+    border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px;
+    font-family: var(--mono); font-size: 13px;
+  }
+  input:focus { outline: none; border-color: var(--accent); }
+  .row { display: flex; gap: 14px; flex-wrap: wrap; }
+  .row > div { flex: 1 1 220px; }
+  .sym-row { display: flex; gap: 8px; margin-bottom: 8px; }
+  .sym-row input:first-child { flex: 2; }
+  .sym-row input:last-child { flex: 3; }
+  button {
+    background: var(--accent); color: #08131f; border: 0; border-radius: 6px;
+    padding: 9px 18px; font-weight: 600; cursor: pointer; font-size: 13px;
+  }
+  button.secondary {
+    background: transparent; color: var(--muted);
+    border: 1px solid var(--line); font-weight: 400;
+  }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .verdict { border-radius: 8px; padding: 14px 18px; margin-bottom: 20px; }
+  .verdict.ok  { background: var(--ok-bg);  border: 1px solid var(--ok); }
+  .verdict.bad { background: var(--bad-bg); border: 1px solid var(--bad); }
+  .verdict h3 { margin: 0 0 6px; font-size: 15px; }
+  .verdict .pos {
+    font-family: var(--mono); color: var(--bad); font-size: 13px;
+  }
+  .kvs { display: grid; grid-template-columns: max-content 1fr; gap: 4px 18px; }
+  .kvs dt { color: var(--muted); }
+  .kvs dd { margin: 0; font-family: var(--mono); font-size: 13px; word-break: break-all; }
+  table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 12.5px; }
+  th, td {
+    text-align: left; padding: 7px 9px; border-bottom: 1px solid var(--line);
+    vertical-align: top;
+  }
+  th { color: var(--muted); font-weight: 500; white-space: nowrap; }
+  td.bytes { letter-spacing: .5px; }
+  .before { color: #f08b84; }
+  .after  { color: #7ee787; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  .stale-warn {
+    background: #2b2110; border: 1px solid #d29922; border-radius: 6px;
+    padding: 8px 12px; margin: 10px 0; font-size: 13px;
+  }
+  code { font-family: var(--mono); color: var(--accent); }
+  .topbtns { display:flex; gap:10px; margin-top:16px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>ELF64 重定位审计台</h1>
+  <p>仅接受 ELF64 小端 <code>ET_REL</code> 文件中唯一的 <code>.text</code> 节与指向它的 RELA 节；
+     仅处理 <code>R_X86_64_64</code> 与 <code>R_X86_64_PC32</code>。审计为全有或全无：任一校验失败即拒绝且不产生补丁。</p>
+</header>
+<main>
+  <section class="panel">
+    <h2>提交审计材料</h2>
+    <div class="row">
+      <div>
+        <label for="audit_id">稳定审计标识（audit id）</label>
+        <input id="audit_id" type="text" placeholder="如 REL-AUDIT-2026-0001" autocomplete="off">
+      </div>
+      <div>
+        <label for="load_base">代码装载基址（十进制或 0x 十六进制）</label>
+        <input id="load_base" type="text" placeholder="0x400000" autocomplete="off">
+      </div>
+    </div>
+    <label for="elf_file">可重定位目标文件（.o，将以 Base64 提交）</label>
+    <input id="elf_file" type="file" accept=".o,application/octet-stream">
+    <div class="topbtns">
+      <button type="button" id="btn_load" class="secondary">读取外部符号清单</button>
+      <button type="button" id="btn_audit">提交审计并冻结结论</button>
+      <button type="button" id="btn_fetch" class="secondary">按标识读取已冻结结论</button>
+    </div>
+
+    <label>被引用外部符号地址（提交时自动读取清单；也可手动填写，S 值）</label>
+    <div id="sym_rows"></div>
+    <div class="sym-row" id="sym_template" style="display:none">
+      <input type="text" class="sym-name" placeholder="符号名" autocomplete="off">
+      <input type="text" class="sym-addr" placeholder="地址（如 0x500000）" autocomplete="off">
+    </div>
+    <p class="hint">地址均为无符号 64 位；加数 A 取自 RELA 项；P = 装载基址 + r_offset。</p>
+  </section>
+
+  <div id="result"></div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+function currentId() { return $("audit_id").value.trim(); }
+
+function collectSymbols() {
+  const out = {};
+  document.querySelectorAll(".sym-row").forEach(row => {
+    const name = row.querySelector(".sym-name").value.trim();
+    const addr = row.querySelector(".sym-addr").value.trim();
+    if (name) out[name] = addr;
+  });
+  return out;
+}
+
+function setSymbolRows(names, values = {}) {
+  const box = $("sym_rows");
+  box.innerHTML = "";
+  const template = $("sym_template");
+  const all = [...new Set(names)];
+  if (all.length === 0) {
+    const row = template.cloneNode(true);
+    row.style.display = "flex";
+    row.removeAttribute("id");
+    box.appendChild(row);
+    return;
+  }
+  all.forEach(name => {
+    const row = template.cloneNode(true);
+    row.style.display = "flex";
+    row.removeAttribute("id");
+    row.querySelector(".sym-name").value = name;
+    if (values[name]) row.querySelector(".sym-addr").value = values[name];
+    box.appendChild(row);
+  });
+}
+
+async function readFile() {
+  const f = $("elf_file").files[0];
+  if (!f) throw new Error("请先选择 .o 文件");
+  const buf = await f.arrayBuffer();
+  let bin = "";
+  const bytes = new Uint8Array(buf);
+  const CH = 0x8000;
+  for (let i = 0; i < bytes.length; i += CH) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + CH));
+  }
+  return btoa(bin);
+}
+
+async function postJson(url, payload) {
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(payload),
+  });
+  let body = null;
+  try { body = await resp.json(); } catch (_) { /* non-json */ }
+  return {status: resp.status, body};
+}
+
+async function loadExternals() {
+  try {
+    const file_base64 = await readFile();
+    const {body} = await postJson("/api/externals", {file_base64});
+    if (!body || !body.ok) throw new Error(body?.error || "解析失败");
+    setSymbolRows(body.external_symbols, collectSymbols());
+    $("result").innerHTML =
+      `<div class="stale-warn">已读取清单：.text 大小 ${body.text_size} 字节，` +
+      `RELA 项 ${body.reloc_count} 条，外部符号 ${body.external_symbols.length} 个。</div>`;
+  } catch (e) {
+    renderRejection({error: e.message, position: "file_base64"}, null, false);
+  }
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, c =>
+    ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+}
+
+function renderRejection(rec, fetched, staleNote) {
+  // Clear any previous success conclusion from view — the server has
+  // likewise overwritten the stored record.
+  $("result").innerHTML = `
+    <div class="verdict bad">
+      <h3>结论：拒绝（REJECTED）${fetched ? "· 已冻结" : "· 首个违约位置"}</h3>
+      <div>${esc(rec.error || "未知错误")}</div>
+      ${rec.position ? `<div class="pos">定位：${esc(rec.position)}</div>` : ""}
+      ${staleNote ? `<div class="stale-warn">${esc(staleNote)}</div>` : ""}
+      ${rec.frozen_at ? `<div class="hint">冻结时间：${esc(rec.frozen_at)}</div>` : ""}
+    </div>`;
+}
+
+function renderSuccess(rec) {
+  const s = rec.summary;
+  const rows = [...rec.patches].sort((a, b) =>
+    parseInt(a.offset, 16) - parseInt(b.offset, 16));
+  $("result").innerHTML = `
+    <div class="verdict ok">
+      <h3>结论：冻结通过（FROZEN）· 标识 ${esc(rec.audit_id)}</h3>
+      <div class="hint">冻结时间：${esc(rec.frozen_at)}　共 ${s.patch_count} 项补丁，全部校验通过</div>
+    </div>
+    <section class="panel">
+      <h2>重定位后代码摘要</h2>
+      <dl class="kvs">
+        <dt>文件大小</dt><dd>${s.file_size} 字节</dd>
+        <dt>文件 SHA-256</dt><dd>${esc(s.file_sha256)}</dd>
+        <dt>.text 大小</dt><dd>${s.text_size} 字节</dd>
+        <dt>装载基址</dt><dd>${esc(s.load_base)}</dd>
+        <dt>原始 .text SHA-256</dt><dd>${esc(s.original_text_sha256)}</dd>
+        <dt>重定位后 .text SHA-256</dt><dd>${esc(s.patched_text_sha256)}</dd>
+        <dt>外部符号</dt><dd>${s.external_symbols.map(esc).join(", ") || "（无）"}</dd>
+      </dl>
+    </section>
+    <section class="panel">
+      <h2>按偏移排序的字节补丁（供独立复算）</h2>
+      <table>
+        <thead><tr>
+          <th>#</th><th>类型</th><th>符号</th><th>偏移</th><th>宽度</th>
+          <th>S</th><th>A</th><th>P</th><th>计算值</th>
+          <th>写入前字节</th><th>写入后字节</th>
+        </tr></thead>
+        <tbody>
+          ${rows.map(p => `
+            <tr>
+              <td>${p.reloc_index}</td>
+              <td>${esc(p.type)}</td>
+              <td>${esc(p.symbol)}</td>
+              <td>${esc(p.offset)}</td>
+              <td>${p.width}</td>
+              <td>${esc(p.S)}</td>
+              <td>${esc(p.A)}</td>
+              <td>${esc(p.P)}</td>
+              <td>${esc(p.value)}</td>
+              <td class="bytes before">${esc(p.before)}</td>
+              <td class="bytes after">${esc(p.after)}</td>
+            </tr>`).join("")}
+        </tbody>
+      </table>
+    </section>`;
+}
+
+async function submitAudit() {
+  const audit_id = currentId();
+  const load_base = $("load_base").value.trim();
+  try {
+    const file_base64 = await readFile();
+    // Refresh the external-symbol list from the object itself so a
+    // missing address can never be silently skipped.
+    const ext = await postJson("/api/externals", {file_base64});
+    if (!ext.body || !ext.body.ok) {
+      renderRejection({error: ext.body?.error || "外部符号清单读取失败",
+                       position: ext.body?.position || "file_base64"}, false, null);
+      return;
+    }
+    const entered = collectSymbols();
+    setSymbolRows(ext.body.external_symbols, entered);
+    const symbols = collectSymbols();
+    for (const name of ext.body.external_symbols) {
+      if (!symbols[name]) {
+        renderRejection({error: `请填写外部符号 ${name} 的地址`,
+                         position: `symbols.${name}`}, false, null);
+        return;
+      }
+    }
+    const {body} = await postJson("/api/audit", {
+      audit_id, load_base, file_base64, symbols,
+    });
+    if (!body) throw new Error("服务器无响应");
+    if (body.ok) renderSuccess(body.record);
+    else {
+      const rec = body.record || {error: body.error, position: body.position};
+      renderRejection(rec, false,
+        "该标识下此前的成功结论（如有）已被本次拒绝结论覆盖清除。");
+    }
+  } catch (e) {
+    renderRejection({error: e.message}, false, null);
+  }
+}
+
+async function fetchFrozen() {
+  const id = currentId();
+  if (!id) { renderRejection({error: "请输入审计标识", position: "audit_id"}, true, null); return; }
+  const resp = await fetch(`/api/audit?id=${encodeURIComponent(id)}`);
+  const body = await resp.json().catch(() => null);
+  if (!body) { renderRejection({error: "服务器无响应"}, true, null); return; }
+  if (!body.ok) { renderRejection(body, true, null); return; }
+  if (body.record.conclusion === "FROZEN") renderSuccess(body.record);
+  else renderRejection(body.record, true, null);
+}
+
+$("btn_load").addEventListener("click", loadExternals);
+$("btn_audit").addEventListener("click", submitAudit);
+$("btn_fetch").addEventListener("click", fetchFrozen);
+</script>
+</body>
+</html>
